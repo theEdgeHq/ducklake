@@ -46,6 +46,7 @@ mkdir "$workspace/driver" "$workspace/extensions"
 curl --fail --location --retry 3 https://github.com/duckdb/duckdb/releases/download/v1.5.5/libduckdb-linux-amd64.zip -o "$workspace/driver.zip"
 unzip -q "$workspace/driver.zip" -d "$workspace/driver"
 echo "fc23f12e376c47be520f75221288281906e7942e8fd6f6ce4849198ba60d0405  $workspace/driver/libduckdb.so" | sha256sum --check
+echo "db566c025fd9794adf98cada0b1cdf7a6e0b1389a99a1970ee940138a699d4ea  $workspace/driver/libduckdb_static.a" | sha256sum --check
 for extension in httpfs postgres_scanner; do
   curl --fail --location --retry 3 "https://extensions.duckdb.org/v1.5.5/linux_amd64/$extension.duckdb_extension.gz" -o "$workspace/extensions/$extension.gz"
   gzip -dc "$workspace/extensions/$extension.gz" > "$workspace/extensions/$extension.duckdb_extension"
@@ -61,9 +62,10 @@ DISABLE_EXTENSIONS_FOR_TEST=1 cmake -S "$workspace/source-duckdb" -B "$workspace
   -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$workspace/roaring-install" \
   -DDUCKDB_EXTENSION_CONFIGS="$repo_root/extension_config.cmake" \
   -DBUILD_UNITTESTS=OFF -DBUILD_SHELL=OFF -DENABLE_SANITIZER=OFF -DENABLE_UBSAN=OFF \
-  -DEXTENSION_STATIC_BUILD=OFF -DOVERRIDE_GIT_DESCRIBE=v1.5.5
+  -DEXTENSION_STATIC_BUILD=ON -DPREBUILT_BINARY="$workspace/driver/libduckdb_static.a" \
+  -DOVERRIDE_GIT_DESCRIBE=v1.5.5
 cmake --build "$workspace/build" --target ducklake_loadable_extension --parallel 4
 
-sha256sum "$workspace/driver/libduckdb.so" \
+sha256sum "$workspace/driver/libduckdb.so" "$workspace/driver/libduckdb_static.a" \
   "$workspace/build/extension/ducklake/ducklake.duckdb_extension" \
   "$workspace/extensions/"*.duckdb_extension > "$workspace/artifacts.sha256"

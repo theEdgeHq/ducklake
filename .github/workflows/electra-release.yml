@@ -146,18 +146,47 @@ jobs:
           cp "$RUNNER_TEMP/metadata.json" "$package_dir/metadata-test.json"
           cp "$RUNNER_TEMP/adbc-merge.json" "$package_dir/adbc-merge-test.json"
           postgres_version=$(docker exec "$POSTGRES_CONTAINER_ID" psql -U postgres -d lake_writer_repro -Atc 'SELECT version()')
-          python3.12 - "$package_dir" "$DUCKLAKE_BUILD_DIR" "$postgres_version" <<'PY'
+          python3.12 - "$package_dir" "$DUCKLAKE_BUILD_DIR" "$postgres_version" "$GITHUB_WORKSPACE" <<'PY'
           import hashlib
           import json
           import pathlib
+          import re
+          import shutil
           import subprocess
           import sys
+          import tarfile
 
           package_dir = pathlib.Path(sys.argv[1])
           build_dir = pathlib.Path(sys.argv[2])
           postgres_version = sys.argv[3]
+          repo_root = pathlib.Path(sys.argv[4])
+          license_stage = package_dir.parent / "electra-ducklake-licenses"
+          license_stage.mkdir()
+
+          def add_license(source, name):
+              destination = license_stage / name
+              shutil.copy2(source, destination)
+              shutil.copy2(source, package_dir / name)
+
+          add_license(repo_root / "LICENSE", "LICENSE-DuckLake.txt")
+          add_license(build_dir / "source-duckdb/LICENSE", "LICENSE-DuckDB.txt")
+          add_license(build_dir / "roaring/LICENSE", "LICENSE-CRoaring.txt")
+          third_party = build_dir / "source-duckdb/third_party"
+          for source in sorted(third_party.rglob("*")):
+              if source.is_file() and source.name.lower().startswith(
+                  ("license", "notice", "copying", "copyright")
+              ):
+                  destination = license_stage / "duckdb-third-party" / source.relative_to(third_party)
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  shutil.copy2(source, destination)
+          with tarfile.open(package_dir / "licenses.tar.gz", "w:gz") as archive:
+              for source in sorted(license_stage.rglob("*")):
+                  if source.is_file():
+                      archive.add(source, arcname=source.relative_to(license_stage))
           source_commit = (build_dir / "source-commit").read_text().strip()
           duckdb_commit = (build_dir / "duckdb-commit").read_text().strip()
+          assert re.fullmatch(r"[0-9a-f]{40}", source_commit), "Invalid fork source commit"
+          assert re.fullmatch(r"[0-9a-f]{40}", duckdb_commit), "Invalid DuckDB source commit"
           manifest = {
               "source_commit": source_commit,
               "duckdb_commit": duckdb_commit,
@@ -173,11 +202,24 @@ jobs:
                   "-DBUILD_SHELL=OFF",
                   "-DENABLE_SANITIZER=OFF",
                   "-DENABLE_UBSAN=OFF",
-                  "-DEXTENSION_STATIC_BUILD=OFF",
+                  "-DEXTENSION_STATIC_BUILD=ON",
+                  "-DPREBUILT_BINARY=<build-dir>/driver/libduckdb_static.a",
                   "-DOVERRIDE_GIT_DESCRIBE=v1.5.5",
               ],
               "extension_sha256": hashlib.sha256(
                   (package_dir / "ducklake-linux-amd64.duckdb_extension").read_bytes()
+              ).hexdigest(),
+              "duckdb_static_sha256": hashlib.sha256(
+                  (build_dir / "driver/libduckdb_static.a").read_bytes()
+              ).hexdigest(),
+              "license_assets": [
+                  "LICENSE-DuckLake.txt",
+                  "LICENSE-DuckDB.txt",
+                  "LICENSE-CRoaring.txt",
+                  "licenses.tar.gz",
+              ],
+              "licenses_archive_sha256": hashlib.sha256(
+                  (package_dir / "licenses.tar.gz").read_bytes()
               ).hexdigest(),
               "metadata_test": json.loads((package_dir / "metadata-test.json").read_text()),
               "adbc_merge_test": json.loads((package_dir / "adbc-merge-test.json").read_text()),
@@ -189,13 +231,15 @@ jobs:
               f"Source commit: `{source_commit}`\n"
               f"DuckDB commit: `{duckdb_commit}`\n"
               "Validation covers 500 metadata checks and 50 concurrent ADBC MERGE rounds.\n\n"
+              "The package includes the source license files and third-party notice archive.\n\n"
               "---\n"
               "Posted by Codex on behalf of Lokesh\n"
           )
           PY
           (
             cd "$package_dir"
-            sha256sum ducklake-linux-amd64.duckdb_extension manifest.json metadata-test.json adbc-merge-test.json
+            sha256sum ducklake-linux-amd64.duckdb_extension manifest.json metadata-test.json adbc-merge-test.json \
+              LICENSE-DuckLake.txt LICENSE-DuckDB.txt LICENSE-CRoaring.txt licenses.tar.gz
           ) > "$package_dir/SHA256SUMS"
           printf 'DUCKLAKE_PACKAGE_DIR=%s\n' "$package_dir" >> "$GITHUB_ENV"
 

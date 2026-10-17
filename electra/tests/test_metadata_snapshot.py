@@ -1,6 +1,5 @@
 import argparse
 import concurrent.futures
-import ctypes
 import json
 import tempfile
 import threading
@@ -8,7 +7,6 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
-import _duckdb
 import duckdb
 import psycopg
 from psycopg import sql
@@ -39,7 +37,6 @@ def main():
     args.dsn = make_conninfo(**options, hostaddr="127.0.0.1")
     if args.checks < 1 or args.writes < 1:
         parser.error("Checks and writes must be positive")
-    ctypes.CDLL(_duckdb.__file__, mode=ctypes.RTLD_GLOBAL)
     schema = "snapshot_probe_" + uuid.uuid4().hex
     lake_schema = "lake_probe_" + uuid.uuid4().hex + "'quoted"
     summary = {}

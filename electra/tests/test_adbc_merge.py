@@ -1,7 +1,6 @@
 import argparse
 import concurrent.futures
 import csv
-import ctypes
 import json
 import platform
 import tempfile
@@ -60,7 +59,6 @@ def validate_dsn(parser, dsn):
 
 
 def open_connection(driver, extension, extension_cache):
-    ctypes.CDLL(str(driver), mode=ctypes.RTLD_GLOBAL)
     connection = dbapi.connect(
         driver=str(driver),
         entrypoint="duckdb_adbc_init",

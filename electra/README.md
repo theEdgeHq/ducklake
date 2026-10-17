@@ -13,6 +13,8 @@
 This directory builds the patched DuckLake extension for DuckDB 1.5.5.
 The build uses a clean checkout and records the source commit in the output.
 The DuckDB source is pinned to `d8cdaa33fda8df955cc76ef58a280f68f4cd43fa`.
+The extension links the verified DuckDB static archive. This allows loading
+through ADBC when the DuckDB driver uses local symbol visibility.
 
 Run the build on Linux AMD64:
 
@@ -33,3 +35,5 @@ all checks pass.
 The release package contains the Linux AMD64 extension, checksums, source and
 build metadata, and the raw test results. Release tags use this form:
 `electra-duckdb-1.5.5-patch.1`.
+The package also contains the DuckLake, DuckDB, and CRoaring license files.
+It contains a `licenses.tar.gz` archive with DuckDB third-party notices.
