@@ -128,6 +128,13 @@ string PostgresMetadataManager::GetLatestSnapshotQuery() const {
 	)";
 }
 
+string PostgresMetadataManager::GetSnapshotAndStatsAndChangesQuery() {
+	auto query = StringUtil::Replace(BaseSnapshotAndStatsAndChangesQuery(), "{METADATA_CATALOG}",
+	                                 "{METADATA_SCHEMA_ESCAPED}");
+	query = StringUtil::Replace(query, "'", "''");
+	return "SELECT * FROM postgres_query({METADATA_CATALOG_NAME_LITERAL}, '" + query + "')";
+}
+
 string PostgresMetadataManager::GenerateFileColumnStatsCTEBody(const CTERequirement &req, TableIndex table_id) {
 	string select_list = "data_file_id";
 	for (const auto &stat : req.referenced_stats) {

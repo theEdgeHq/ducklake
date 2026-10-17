@@ -1,0 +1,241 @@
+name: Electra DuckLake release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example electra-duckdb-1.5.5-patch.1
+        required: true
+        type: string
+      publish_draft:
+        description: Create a new draft GitHub release after validation
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: electra-ducklake-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16@sha256:75adc2a65806c96bc0e59030230bfe3f1c1b0d6d8f8181a8913e2b8b53bdc166
+        env:
+          POSTGRES_DB: lake_writer_repro
+          POSTGRES_PASSWORD: lake_repro
+          POSTGRES_USER: postgres
+        ports:
+          - 15545:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d lake_writer_repro"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Validate source and release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^electra-duckdb-1[.]5[.]5-patch[.][0-9]+$ ]]
+          [[ -z "$(git status --porcelain --untracked-files=all)" ]]
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes build-essential cmake curl ninja-build unzip \
+            python3.12 python3.12-dev python3.12-venv
+
+      - name: Build patched extension
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/electra-ducklake-build"
+          electra/build_linux.sh "$build_dir"
+          printf 'DUCKLAKE_BUILD_DIR=%s\n' "$build_dir" >> "$GITHUB_ENV"
+
+      - name: Create Python test environment
+        run: |
+          set -euo pipefail
+          python3.12 -m venv "$RUNNER_TEMP/electra-ducklake-venv"
+          "$RUNNER_TEMP/electra-ducklake-venv/bin/python" -m pip install --disable-pip-version-check \
+            'duckdb==1.5.5' \
+            'psycopg[binary]==3.3.6' \
+            'adbc-driver-manager==1.10.0' \
+            'pyarrow==23.0.1'
+          printf 'DUCKLAKE_PYTHON=%s\n' "$RUNNER_TEMP/electra-ducklake-venv/bin/python" >> "$GITHUB_ENV"
+
+      - name: Configure PostgreSQL CSV logging
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          container_id="$POSTGRES_CONTAINER_ID"
+          test -n "$container_id"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_destination = 'csvlog'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET logging_collector = 'on'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_directory = 'pg_log'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_filename = 'postgresql-%Y%m%d%H%M%S.csv'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_statement = 'all'"
+          docker exec "$container_id" sh -c 'mkdir -p /var/lib/postgresql/data/pg_log && chown postgres:postgres /var/lib/postgresql/data/pg_log'
+          docker restart "$container_id" >/dev/null
+          for attempt in $(seq 1 30); do
+            if docker exec "$container_id" pg_isready -U postgres -d lake_writer_repro >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          docker exec "$container_id" pg_isready -U postgres -d lake_writer_repro
+          postgres_log="$RUNNER_TEMP/postgres.csv"
+          docker exec "$container_id" sh -c 'while ! find /var/lib/postgresql/data/pg_log -name "*.csv" -print -quit | grep -q .; do sleep 1; done; set -- /var/lib/postgresql/data/pg_log/*.csv; exec tail -F "$1"' > "$postgres_log" 2>"$RUNNER_TEMP/postgres-tail.log" &
+          tail_pid=$!
+          printf 'POSTGRES_CONTAINER_ID=%s\n' "$container_id" >> "$GITHUB_ENV"
+          printf 'POSTGRES_LOG=%s\n' "$postgres_log" >> "$GITHUB_ENV"
+          printf 'POSTGRES_LOG_TAIL_PID=%s\n' "$tail_pid" >> "$GITHUB_ENV"
+
+      - name: Run metadata snapshot test
+        run: |
+          set -euo pipefail
+          "$DUCKLAKE_PYTHON" electra/tests/test_metadata_snapshot.py \
+            --dsn 'host=127.0.0.1 port=15545 dbname=lake_writer_repro user=postgres password=lake_repro' \
+            --extension "$DUCKLAKE_BUILD_DIR/build/extension/ducklake/ducklake.duckdb_extension" \
+            --extension-cache "$DUCKLAKE_BUILD_DIR/extensions" \
+            --checks 500 --writes 300 > "$RUNNER_TEMP/metadata.json"
+
+      - name: Run Linux ADBC MERGE test
+        run: |
+          set -euo pipefail
+          "$DUCKLAKE_PYTHON" electra/tests/test_adbc_merge.py \
+            --driver "$DUCKLAKE_BUILD_DIR/driver/libduckdb.so" \
+            --extension "$DUCKLAKE_BUILD_DIR/build/extension/ducklake/ducklake.duckdb_extension" \
+            --extension-cache "$DUCKLAKE_BUILD_DIR/extensions" \
+            --dsn 'host=127.0.0.1 port=15545 dbname=lake_writer_repro user=postgres password=lake_repro' \
+            --rounds 50 --workers 4 --external-writer \
+            --postgres-log "$POSTGRES_LOG" \
+            --output "$RUNNER_TEMP/adbc-merge.json"
+
+      - name: Stop PostgreSQL log capture
+        if: always()
+        run: |
+          set -euo pipefail
+          if [[ -n "${POSTGRES_LOG_TAIL_PID:-}" ]]; then
+            kill "$POSTGRES_LOG_TAIL_PID" 2>/dev/null || true
+            wait "$POSTGRES_LOG_TAIL_PID" 2>/dev/null || true
+          fi
+
+      - name: Package release assets
+        env:
+          POSTGRES_CONTAINER_ID: ${{ job.services.postgres.id }}
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/electra-ducklake-package"
+          mkdir -p "$package_dir"
+          cp "$DUCKLAKE_BUILD_DIR/build/extension/ducklake/ducklake.duckdb_extension" \
+            "$package_dir/ducklake-linux-amd64.duckdb_extension"
+          cp "$RUNNER_TEMP/metadata.json" "$package_dir/metadata-test.json"
+          cp "$RUNNER_TEMP/adbc-merge.json" "$package_dir/adbc-merge-test.json"
+          postgres_version=$(docker exec "$POSTGRES_CONTAINER_ID" psql -U postgres -d lake_writer_repro -Atc 'SELECT version()')
+          python3.12 - "$package_dir" "$DUCKLAKE_BUILD_DIR" "$postgres_version" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import subprocess
+          import sys
+
+          package_dir = pathlib.Path(sys.argv[1])
+          build_dir = pathlib.Path(sys.argv[2])
+          postgres_version = sys.argv[3]
+          source_commit = (build_dir / "source-commit").read_text().strip()
+          duckdb_commit = (build_dir / "duckdb-commit").read_text().strip()
+          manifest = {
+              "source_commit": source_commit,
+              "duckdb_commit": duckdb_commit,
+              "duckdb_version": "1.5.5",
+              "platform": "linux_amd64",
+              "postgres_version": postgres_version,
+              "roaring_version": "4.3.12",
+              "compiler": subprocess.check_output(["gcc", "--version"], text=True).splitlines()[0],
+              "cmake": subprocess.check_output(["cmake", "--version"], text=True).splitlines()[0],
+              "build_flags": [
+                  "-DCMAKE_BUILD_TYPE=Release",
+                  "-DBUILD_UNITTESTS=OFF",
+                  "-DBUILD_SHELL=OFF",
+                  "-DENABLE_SANITIZER=OFF",
+                  "-DENABLE_UBSAN=OFF",
+                  "-DEXTENSION_STATIC_BUILD=OFF",
+                  "-DOVERRIDE_GIT_DESCRIBE=v1.5.5",
+              ],
+              "extension_sha256": hashlib.sha256(
+                  (package_dir / "ducklake-linux-amd64.duckdb_extension").read_bytes()
+              ).hexdigest(),
+              "metadata_test": json.loads((package_dir / "metadata-test.json").read_text()),
+              "adbc_merge_test": json.loads((package_dir / "adbc-merge-test.json").read_text()),
+          }
+          (package_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          (package_dir / "RELEASE_NOTES.md").write_text(
+              f"# Electra DuckLake {source_commit[:12]}\n\n"
+              "This release contains the patched DuckLake extension for DuckDB 1.5.5.\n\n"
+              f"Source commit: `{source_commit}`\n"
+              f"DuckDB commit: `{duckdb_commit}`\n"
+              "Validation covers 500 metadata checks and 50 concurrent ADBC MERGE rounds.\n\n"
+              "---\n"
+              "Posted by Codex on behalf of Lokesh\n"
+          )
+          PY
+          (
+            cd "$package_dir"
+            sha256sum ducklake-linux-amd64.duckdb_extension manifest.json metadata-test.json adbc-merge-test.json
+          ) > "$package_dir/SHA256SUMS"
+          printf 'DUCKLAKE_PACKAGE_DIR=%s\n' "$package_dir" >> "$GITHUB_ENV"
+
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: electra-ducklake-validation-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/metadata.json
+            ${{ runner.temp }}/adbc-merge.json
+            ${{ runner.temp }}/postgres.csv
+            ${{ runner.temp }}/postgres-tail.log
+            ${{ runner.temp }}/electra-ducklake-build/artifacts.sha256
+
+      - name: Upload release package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: electra-ducklake-package-${{ github.run_id }}
+          path: ${{ env.DUCKLAKE_PACKAGE_DIR }}
+          if-no-files-found: error
+
+      - name: Create draft GitHub release
+        if: ${{ inputs.publish_draft == true }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          source_commit=$(cat "$DUCKLAKE_BUILD_DIR/source-commit")
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release already exists for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if gh api --silent "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "A tag already exists for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" "$DUCKLAKE_PACKAGE_DIR"/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft --title "$RELEASE_TAG" --target "$source_commit" \
+            --notes-file "$DUCKLAKE_PACKAGE_DIR/RELEASE_NOTES.md"
