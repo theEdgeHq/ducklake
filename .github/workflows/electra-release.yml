@@ -33,6 +33,8 @@ jobs:
           POSTGRES_USER: postgres
         ports:
           - 15545:5432
+        volumes:
+          - /tmp/electra-ducklake-pg-log:/electra-pg-log
         options: >-
           --health-cmd "pg_isready -U postgres -d lake_writer_repro"
           --health-interval 5s
@@ -85,10 +87,11 @@ jobs:
           test -n "$container_id"
           docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_destination = 'csvlog'"
           docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET logging_collector = 'on'"
-          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_directory = 'pg_log'"
-          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_filename = 'postgresql-%Y%m%d%H%M%S.csv'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_directory = '/electra-pg-log'"
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_filename = 'postgresql.log'"
           docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_statement = 'all'"
-          docker exec "$container_id" sh -c 'mkdir -p /var/lib/postgresql/data/pg_log && chown postgres:postgres /var/lib/postgresql/data/pg_log'
+          docker exec "$container_id" psql -U postgres -d lake_writer_repro -v ON_ERROR_STOP=1 -c "ALTER SYSTEM SET log_file_mode = '0644'"
+          docker exec "$container_id" sh -c 'chown postgres:postgres /electra-pg-log && chmod 0755 /electra-pg-log'
           docker restart "$container_id" >/dev/null
           for attempt in $(seq 1 30); do
             if docker exec "$container_id" pg_isready -U postgres -d lake_writer_repro >/dev/null 2>&1; then
@@ -97,12 +100,8 @@ jobs:
             sleep 2
           done
           docker exec "$container_id" pg_isready -U postgres -d lake_writer_repro
-          postgres_log="$RUNNER_TEMP/postgres.csv"
-          docker exec "$container_id" sh -c 'while ! find /var/lib/postgresql/data/pg_log -name "*.csv" -print -quit | grep -q .; do sleep 1; done; set -- /var/lib/postgresql/data/pg_log/*.csv; exec tail -F "$1"' > "$postgres_log" 2>"$RUNNER_TEMP/postgres-tail.log" &
-          tail_pid=$!
-          printf 'POSTGRES_CONTAINER_ID=%s\n' "$container_id" >> "$GITHUB_ENV"
+          postgres_log="/tmp/electra-ducklake-pg-log/postgresql.csv"
           printf 'POSTGRES_LOG=%s\n' "$postgres_log" >> "$GITHUB_ENV"
-          printf 'POSTGRES_LOG_TAIL_PID=%s\n' "$tail_pid" >> "$GITHUB_ENV"
 
       - name: Run metadata snapshot test
         run: |
@@ -124,15 +123,6 @@ jobs:
             --rounds 50 --workers 4 --external-writer \
             --postgres-log "$POSTGRES_LOG" \
             --output "$RUNNER_TEMP/adbc-merge.json"
-
-      - name: Stop PostgreSQL log capture
-        if: always()
-        run: |
-          set -euo pipefail
-          if [[ -n "${POSTGRES_LOG_TAIL_PID:-}" ]]; then
-            kill "$POSTGRES_LOG_TAIL_PID" 2>/dev/null || true
-            wait "$POSTGRES_LOG_TAIL_PID" 2>/dev/null || true
-          fi
 
       - name: Package release assets
         env:
@@ -252,8 +242,7 @@ jobs:
           path: |
             ${{ runner.temp }}/metadata.json
             ${{ runner.temp }}/adbc-merge.json
-            ${{ runner.temp }}/postgres.csv
-            ${{ runner.temp }}/postgres-tail.log
+            /tmp/electra-ducklake-pg-log/postgresql.csv
             ${{ runner.temp }}/electra-ducklake-build/artifacts.sha256
 
       - name: Upload release package
