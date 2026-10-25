@@ -1,0 +1,151 @@
+# name: test/sql/stats/postgres_uuid_pruning.test
+# description: PostgreSQL UUID predicates prune files and keep files with unusable bounds
+# group: [stats]
+
+require ducklake
+
+require parquet
+
+require postgres_scanner
+
+require-env DUCKLAKE_CI
+
+require-env DUCKLAKE_CONNECTION
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS lake (DATA_PATH '{DATA_PATH}/postgres_uuid_pruning', DATA_INLINING_ROW_LIMIT 0)
+
+statement ok
+CREATE TABLE lake.uuid_pruning_test (network_id UUID, value INTEGER, time_window_start TIMESTAMP DEFAULT TIMESTAMP '2026-10-18 09:30:00', execution_sequence BIGINT DEFAULT 1)
+
+statement ok
+ALTER TABLE lake.uuid_pruning_test SET PARTITIONED BY (network_id)
+
+statement ok
+INSERT INTO lake.uuid_pruning_test (network_id, value) VALUES ('7fffffff-ffff-ffff-ffff-ffffffffffff', 1), ('80000000-0000-0000-0000-000000000000', 2)
+
+query I
+SELECT value FROM lake.uuid_pruning_test WHERE network_id = '80000000-0000-0000-0000-000000000000'::UUID
+----
+2
+
+query II
+EXPLAIN ANALYZE SELECT value FROM lake.uuid_pruning_test WHERE network_id = '80000000-0000-0000-0000-000000000000'::UUID
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+statement ok
+PREPARE uuid_lookup AS SELECT value FROM lake.uuid_pruning_test WHERE network_id IN (?::UUID)
+
+query I
+EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+2
+
+query II
+EXPLAIN ANALYZE EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT value FROM lake.uuid_pruning_test WHERE network_id > '7fffffff-ffff-ffff-ffff-ffffffffffff'::UUID
+----
+2
+
+statement ok
+CREATE TEMP TABLE lfa_replacement_scopes AS SELECT '80000000-0000-0000-0000-000000000000'::UUID network_id, TIMESTAMP '2026-10-18 09:30:00' time_window_start, 2::BIGINT execution_sequence, NULL::BIGINT accepted_sequence, true missing_watermark, 'replace'::VARCHAR disposition
+
+statement ok
+CREATE TEMP TABLE lfa_missing_watermark_scopes AS SELECT network_id, time_window_start FROM lfa_replacement_scopes WHERE missing_watermark
+
+statement ok
+PREPARE recover_sequence AS UPDATE lfa_replacement_scopes AS target SET accepted_sequence = stored.execution_sequence FROM (SELECT metrics.network_id, metrics.time_window_start, CASE WHEN COUNT(DISTINCT metrics.execution_sequence) = 1 AND COUNT(*) FILTER (WHERE metrics.execution_sequence IS NULL) = 0 AND MIN(metrics.execution_sequence) > 0 THEN MAX(metrics.execution_sequence) ELSE error('ambiguous stored LFA metric sequence for missing watermark') END AS execution_sequence FROM lake.uuid_pruning_test AS metrics INNER JOIN lfa_missing_watermark_scopes AS missing ON metrics.network_id = missing.network_id AND metrics.time_window_start = missing.time_window_start WHERE metrics.network_id IN (?::UUID) AND metrics.time_window_start >= ?::TIMESTAMP AND metrics.time_window_start <= ?::TIMESTAMP GROUP BY metrics.network_id, metrics.time_window_start) AS stored WHERE target.network_id = stored.network_id AND target.time_window_start = stored.time_window_start AND target.missing_watermark
+
+query II
+EXPLAIN ANALYZE EXECUTE recover_sequence('80000000-0000-0000-0000-000000000000', TIMESTAMP '2026-10-18 09:30:00', TIMESTAMP '2026-10-18 09:30:00')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT accepted_sequence FROM lfa_replacement_scopes
+----
+1
+
+statement ok
+PREPARE replace_metrics AS DELETE FROM lake.uuid_pruning_test WHERE network_id IN (?::UUID) AND time_window_start >= ?::TIMESTAMP AND time_window_start <= ?::TIMESTAMP AND (network_id, time_window_start) IN (SELECT network_id, time_window_start FROM lfa_replacement_scopes WHERE disposition = 'replace')
+
+statement ok
+BEGIN
+
+query II
+EXPLAIN ANALYZE EXECUTE replace_metrics('80000000-0000-0000-0000-000000000000', TIMESTAMP '2026-10-18 09:30:00', TIMESTAMP '2026-10-18 09:30:00')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 1.*
+
+query I
+SELECT value FROM lake.uuid_pruning_test ORDER BY value
+----
+1
+
+statement ok
+ROLLBACK
+
+query I
+SELECT value FROM lake.uuid_pruning_test ORDER BY value
+----
+1
+2
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_file_column_stats SET min_value = 'invalid' WHERE table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'uuid_pruning_test') AND column_id = 1
+
+query I
+EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+2
+
+query II
+EXPLAIN ANALYZE EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 2.*
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_file_column_stats SET min_value = 'ffffffff-ffff-ffff-ffff-ffffffffffff', max_value = '00000000-0000-0000-0000-000000000000' WHERE table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'uuid_pruning_test') AND column_id = 1
+
+query I
+EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+2
+
+query II
+EXPLAIN ANALYZE EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 2.*
+
+statement ok
+UPDATE __ducklake_metadata_lake.ducklake_file_column_stats SET min_value = NULL, max_value = '80000000-0000-0000-0000-00000000000' WHERE table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'uuid_pruning_test') AND column_id = 1
+
+query I
+EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+2
+
+query II
+EXPLAIN ANALYZE EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 2.*
+
+statement ok
+DELETE FROM __ducklake_metadata_lake.ducklake_file_column_stats WHERE table_id IN (SELECT table_id FROM __ducklake_metadata_lake.ducklake_table WHERE table_name = 'uuid_pruning_test') AND column_id = 1
+
+query I
+EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+2
+
+query II
+EXPLAIN ANALYZE EXECUTE uuid_lookup('80000000-0000-0000-0000-000000000000')
+----
+analyzed_plan	<REGEX>:.*Total Files Read: 2.*

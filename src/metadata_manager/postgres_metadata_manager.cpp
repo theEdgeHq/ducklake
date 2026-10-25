@@ -91,6 +91,9 @@ string PostgresMetadataManager::CastValueToTarget(const Value &value, const Logi
 	if (value.IsNull() || value.ToString().find('\0') != string::npos || type.id() == LogicalTypeId::BLOB) {
 		return string();
 	}
+	if (type.id() == LogicalTypeId::UUID) {
+		return SQLString::ToString(value.DefaultCastAs(type).ToString()) + "::UUID";
+	}
 	if (RequiresValueComparison(type) && (!CanCastPostgresStatsForValueComparison(type) || !ValueIsFinite(value))) {
 		return string();
 	}
@@ -147,6 +150,12 @@ static string PostgresSafeTemporalStatsCast(const string &stats, const LogicalTy
 
 string PostgresMetadataManager::CastStatsToTarget(const string &stats, const LogicalType &type,
                                                   StatsCastType cast_type) {
+	if (type.id() == LogicalTypeId::UUID) {
+		return StringUtil::Format(
+		    "(CASE WHEN %s ~ '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' "
+		    "THEN %s::UUID END)",
+		    stats, stats);
+	}
 	if (IsPostgresTemporalStatsType(type)) {
 		auto cast = PostgresSafeTemporalStatsCast(stats, type);
 		if (cast_type == StatsCastType::ORDERING) {
@@ -161,6 +170,23 @@ string PostgresMetadataManager::CastStatsToTarget(const string &stats, const Log
 		return WithPostgresBinaryCollation(stats);
 	}
 	return string();
+}
+
+string PostgresMetadataManager::GenerateConstantFilter(ExpressionType comparison_type, const Value &constant,
+                                                       const LogicalType &type, unordered_set<string> &referenced_stats,
+                                                       const string &stats_alias) {
+	auto condition =
+	    DuckLakeMetadataManager::GenerateConstantFilter(comparison_type, constant, type, referenced_stats, stats_alias);
+	if (type.id() != LogicalTypeId::UUID || condition.empty()) {
+		return condition;
+	}
+	referenced_stats.insert("min_value");
+	referenced_stats.insert("max_value");
+	auto min_value = CastStatsToTarget(stats_alias + ".min_value", type, StatsCastType::MIN);
+	auto max_value = CastStatsToTarget(stats_alias + ".max_value", type, StatsCastType::MAX);
+	// A failed cast must keep the file: SQL WHERE would otherwise discard its unknown comparison.
+	return StringUtil::Format("(CASE WHEN %s IS NULL OR %s IS NULL THEN TRUE WHEN %s > %s THEN TRUE ELSE (%s) END)",
+	                          min_value, max_value, min_value, max_value, condition);
 }
 
 PostgresMetadataManager::PostgresMetadataManager(DuckLakeTransaction &transaction)

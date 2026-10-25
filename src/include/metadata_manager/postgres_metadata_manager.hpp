@@ -58,6 +58,8 @@ protected:
 	                             const string &metadata_table_prefix) override;
 	string CastValueToTarget(const Value &value, const LogicalType &type) override;
 	string CastStatsToTarget(const string &stats, const LogicalType &type, StatsCastType cast_type) override;
+	string GenerateConstantFilter(ExpressionType comparison_type, const Value &constant, const LogicalType &type,
+	                              unordered_set<string> &referenced_stats, const string &stats_alias) override;
 };
 
 } // namespace duckdb
