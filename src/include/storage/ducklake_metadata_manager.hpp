@@ -709,9 +709,13 @@ private:
 	virtual string CastValueToTarget(const Value &val, const LogicalType &type);
 	virtual string CastStatsToTarget(const string &stats, const LogicalType &type,
 	                                 StatsCastType cast_type = StatsCastType::ORDERING);
+
+protected:
 	virtual string GenerateConstantFilter(ExpressionType comparison_type, const Value &constant,
 	                                      const LogicalType &type, unordered_set<string> &referenced_stats,
 	                                      const string &stats_alias);
+
+private:
 	virtual string GenerateConstantFilterDouble(ExpressionType comparison_type, const Value &constant,
 	                                            const LogicalType &type, unordered_set<string> &referenced_stats,
 	                                            const string &stats_alias);
